@@ -1,0 +1,40 @@
+services:
+  api:
+    build:
+      context: ./backend
+    image: handoff-aligner-api
+    environment:
+      PYTHONUNBUFFERED: "1"
+    ports:
+      # Host port overridable via API_PORT (default 8000 -> 8000).
+      - "${API_PORT:-8000}:8000"
+
+  web:
+    build:
+      context: ./frontend
+    image: handoff-aligner-web
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      # Host port overridable via WEB_PORT (default 8080 on the host -> 80).
+      - "${WEB_PORT:-8080}:80"
+
+  # One-off acceptance service: real cross-container integration check
+  # (health, a golden alignment, cost rules, single-error contract).
+  # Run with:  docker compose run --rm verify
+  verify:
+    build:
+      context: ./backend
+    image: handoff-aligner-api
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    volumes:
+      - ./verify:/verify:ro
+    environment:
+      API_URL: http://api:8000
+      WEB_URL: http://web:80
+    entrypoint: ["python", "/verify/verify.py"]

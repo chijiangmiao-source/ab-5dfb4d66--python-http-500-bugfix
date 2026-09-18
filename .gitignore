@@ -1,0 +1,25 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# ---- Node / build output ----
+node_modules/
+dist/
+*.tsbuildinfo
+
+# ---- Playwright / test artifacts ----
+test-results/
+playwright-report/
+blob-report/
+
+# ---- editor / OS ----
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ---- local env overrides ----
+.env
