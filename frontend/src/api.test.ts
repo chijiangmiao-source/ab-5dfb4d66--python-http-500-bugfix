@@ -32,6 +32,13 @@ describe("rootRawText", () => {
     const raw = `[{"time": 9007199254740993, "text": "a"}]`;
     expect(rootRawText(raw)).toContain("9007199254740993");
   });
+
+  it("keeps 4301-digit literals verbatim", () => {
+    const digits = "9".repeat(4301);
+    const raw = rootRawText(`  [{"time": ${digits}, "text": "x"}]  `);
+    expect(raw).toBe(`[{"time": ${digits}, "text": "x"}]`);
+    expect(raw).toContain(digits);
+  });
 });
 
 describe("alignNotes", () => {
@@ -84,6 +91,34 @@ describe("alignNotes", () => {
     );
     expect(sentBody).toContain("9007199254740993");
     expect(sentBody).toContain("9007199254740995");
+  });
+
+  it("round-trips a 4301-digit timestamp without Number truncation", async () => {
+    const digits = "9".repeat(4301);
+    let sentBody = "";
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      sentBody = init!.body as string;
+      // Raw response text: JSON.stringify could not hold the huge int.
+      return new Response(
+        `{"steps":[{"action":"right_gap","left":{"time":${digits},"text":"x"},` +
+          `"right":null,"cost":2000,"cumulative_cost":2000}],` +
+          `"total_cost":2000,"counts":{"match":0,"left_gap":0,"right_gap":1},` +
+          `"costs":{"gap":2000,"mismatch_penalty":3000}}`,
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+    const result = await alignNotes(
+      rootRawText(`[{"time": ${digits}, "text": "x"}]`),
+      `[]`,
+      [],
+      fetchMock as unknown as typeof fetch,
+    );
+    // The request carried the exact digits...
+    expect(sentBody).toContain(digits);
+    // ...and the parsed response keeps them as an exact bigint.
+    const time = result.steps[0].left!.time;
+    expect(typeof time).toBe("bigint");
+    expect(time.toString()).toBe(digits);
   });
 
   it("surfaces a single error path on 422", async () => {

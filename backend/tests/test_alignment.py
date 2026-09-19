@@ -281,6 +281,29 @@ class TestAlignWithAnchors:
         assert result["steps"][0]["cost"] == MISMATCH_PENALTY
         assert result["total_cost"] == MISMATCH_PENALTY
 
+    def test_huge_integer_timestamps_stay_exact(self):
+        # Arbitrary-precision times: |Δt| arithmetic on 4301-digit integers
+        # must be exact (no float rounding anywhere in the DP or traceback).
+        big = int("9" * 4301)
+        result = align([note(big, "a")], [note(big + 1, "a")])
+        step = result["steps"][0]
+        assert step["action"] == "match"
+        assert step["cost"] == 1
+        assert step["left"]["time"] == big
+        assert step["right"]["time"] == big + 1
+        assert result["total_cost"] == 1
+
+    def test_huge_integer_anchor_cost_is_exact(self):
+        big = int("9" * 4301)
+        left = [note(big, "a"), note(big + 5000, "b")]
+        right = [note(big + 120, "a"), note(big + 4800, "b")]
+        result = align_with_anchors(left, right, [{"left": 1, "right": 1}])
+        pinned = result["steps"][1]
+        assert pinned["anchor"] is True
+        assert pinned["cost"] == 200  # |(big+5000) − (big+4800)|
+        assert pinned["left"]["time"] == big + 5000
+        assert result["total_cost"] == sum(s["cost"] for s in result["steps"])
+
     def test_multiple_anchors_split_into_independent_segments(self):
         left = [note(0, "a"), note(4200, "b"), note(9000, "c")]
         right = [note(150, "a"), note(4100, "b"), note(12000, "d")]

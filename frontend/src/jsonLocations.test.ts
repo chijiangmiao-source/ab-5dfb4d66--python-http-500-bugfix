@@ -33,6 +33,17 @@ describe("parseLocated", () => {
     expect(JSON.parse(`9007199254740993`)).toBe(9007199254740992);
   });
 
+  it("keeps 4301-digit integer literals as exact bigints", () => {
+    // Beyond CPython's default 4300-digit int<->str limit: the backend
+    // accepts these (arbitrary-precision contract), so the browser side
+    // must parse them without ever touching Number.
+    const digits = "9".repeat(4301);
+    const { value } = parseLocated(`[{"time": ${digits}, "text": "x"}]`);
+    const arr = value as Array<{ time: bigint }>;
+    expect(typeof arr[0].time).toBe("bigint");
+    expect(arr[0].time.toString()).toBe(digits);
+  });
+
   it("parses nested structures like JSON.parse (modulo integer bigints)", () => {
     const { value } = parseLocated(`{"a": {"b": [10, {"c": 20}]}}`);
     expect(value).toEqual({ a: { b: [10n, { c: 20n }] } });

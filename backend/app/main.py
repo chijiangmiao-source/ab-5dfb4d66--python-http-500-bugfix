@@ -17,6 +17,13 @@ out-of-range/duplicated/crossing anchor) produce exactly ONE 4xx failure
 carrying the first error path, e.g. ``{"error": "...", "path": "left[2].time"}``
 or ``{"error": "...", "path": "anchors[1].left"}``.  Pydantic's bulk error
 lists are deliberately bypassed so the caller can mark a single location.
+
+``time`` is an arbitrary-precision integer (see README): importing the
+``app`` package disables CPython's default 4300-digit int<->str conversion
+limit, so parsing, cost arithmetic, error formatting and response
+serialization all accept timestamps of any digit count without ever
+rounding them through floats — a 4301-digit timestamp gets a normal 200
+alignment, never a 500.
 """
 
 from __future__ import annotations

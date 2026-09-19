@@ -391,4 +391,46 @@ describe("App", () => {
     expect(sentBody).toContain("9007199254740995");
     vi.unstubAllGlobals();
   });
+
+  it("renders a 4301-digit timestamp exactly after a full submit round trip", async () => {
+    // Beyond CPython's default 4300-digit int<->str limit: input, request
+    // forwarding, response parsing and rendering must never route the value
+    // through a JavaScript Number.
+    const digits = "9".repeat(4301);
+    let sentBody = "";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        sentBody = init!.body as string;
+        return new Response(
+          `{"steps":[{"action":"right_gap","left":{"time":${digits},"text":"x"},` +
+            `"right":null,"cost":2000,"cumulative_cost":2000}],` +
+            `"total_cost":2000,"counts":{"match":0,"left_gap":0,"right_gap":1},` +
+            `"costs":{"gap":2000,"mismatch_penalty":3000}}`,
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }),
+    );
+    render(<App />);
+    fireEvent.change(screen.getByTestId("input-left"), {
+      target: { value: `[{"time": ${digits}, "text": "x"}]` },
+    });
+    fireEvent.change(screen.getByTestId("input-right"), {
+      target: { value: "[]" },
+    });
+    fireEvent.click(screen.getByTestId("submit"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("result-panel")).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("error-banner")).toBeNull();
+    // The exact digits left the browser verbatim...
+    expect(sentBody).toContain(digits);
+    // ...and every one of the 4301 digits is rendered back, not a rounded
+    // double (which would show "1e+4301"-style or altered trailing digits).
+    const row = screen.getByTestId("timeline-row");
+    expect(row.textContent).toContain(`${digits} ms`);
+    expect(screen.getByTestId("total-cost")).toHaveTextContent("2000");
+    vi.unstubAllGlobals();
+  });
 });

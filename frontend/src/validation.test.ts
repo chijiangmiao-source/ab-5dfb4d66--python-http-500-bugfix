@@ -69,6 +69,16 @@ describe("validateSequence", () => {
     expect(validateSequence([n(t), n(t)])?.path).toBe("[1].time");
   });
 
+  it("compares 4301-digit bigint timestamps exactly", () => {
+    // Beyond CPython's default int<->str limit; the arbitrary-precision
+    // contract means these validate client-side without any Number coercion.
+    const a = BigInt("9".repeat(4301));
+    const b = a + 2n;
+    expect(validateSequence([n(a), n(b)])).toBeNull();
+    expect(validateSequence([n(b), n(a)])?.path).toBe("[1].time");
+    expect(validateSequence([n(a), n(a)])?.path).toBe("[1].time");
+  });
+
   it("rejects float times even though they are numbers", () => {
     expect(validateSequence([n(1.0), n(2.5)])?.path).toBe("[1].time");
   });

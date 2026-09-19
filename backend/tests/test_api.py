@@ -1,5 +1,7 @@
 """End-to-end API tests through FastAPI's ASGI stack (real request cycle)."""
 
+import sys
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -317,3 +319,118 @@ class TestAnchorsApi:
         )
         assert resp.status_code == 422
         assert resp.json()["path"] == "left[1].time"
+
+
+class TestHugeTimestamps:
+    """Arbitrary-precision ``time`` at and beyond CPython's default limit.
+
+    Stock Python 3.12 caps int<->str conversions at 4300 digits; the app
+    disables that cap (see ``app/__init__.py``) because the public contract
+    is arbitrary precision.  Values at the boundary and far beyond it must
+    align successfully with their decimal digits preserved exactly — and
+    invalid huge values must still produce ONE structured 4xx, never an
+    unstructured 500.
+    """
+
+    @staticmethod
+    def raw_post(body: bytes):
+        return client.post(
+            "/api/align",
+            content=body,
+            headers={"content-type": "application/json"},
+        )
+
+    @staticmethod
+    def single_left_body(digits: str) -> bytes:
+        return (
+            '{"left":[{"time":' + digits + ',"text":"x"}],"right":[]}'
+        ).encode()
+
+    def test_importing_the_app_disables_the_int_str_limit(self):
+        # The mechanism behind the contract: no digit cap in this process.
+        assert sys.get_int_max_str_digits() == 0
+
+    def test_boundary_4300_digit_timestamp_accepted(self):
+        digits = "8" * 4300  # exactly CPython's default limit
+        resp = self.raw_post(self.single_left_body(digits))
+        assert resp.status_code == 200
+        assert resp.text != "Internal Server Error"
+        step = resp.json()["steps"][0]
+        assert step["action"] == "right_gap"
+        assert step["left"]["time"] == int(digits)
+
+    def test_over_threshold_4301_digit_timestamp_accepted(self):
+        # The reported regression: 4301 digits used to crash json.loads.
+        digits = "9" * 4301
+        resp = self.raw_post(self.single_left_body(digits))
+        assert resp.status_code == 200
+        assert resp.text != "Internal Server Error"
+        data = resp.json()
+        assert data["steps"][0]["action"] == "right_gap"
+        assert data["steps"][0]["cost"] == data["total_cost"] == 2000
+        # Digit-for-digit identical in the parsed body AND on the wire.
+        assert str(data["steps"][0]["left"]["time"]) == digits
+        assert digits in resp.text
+
+    def test_far_over_threshold_timestamp_has_no_hidden_ceiling(self):
+        digits = "7" * 10_000
+        resp = self.raw_post(self.single_left_body(digits))
+        assert resp.status_code == 200
+        assert str(resp.json()["steps"][0]["left"]["time"]) == digits
+
+    def test_non_uniform_digits_preserved_exactly(self):
+        digits = "1234567890" * 431  # 4310 digits, not a repeated digit
+        resp = self.raw_post(self.single_left_body(digits))
+        assert resp.status_code == 200
+        assert str(resp.json()["steps"][0]["left"]["time"]) == digits
+
+    def test_anchor_path_with_over_threshold_timestamps(self):
+        # Anchor cost computation (|Δt| on huge ints) and serialization of
+        # the huge values must both stay exact.
+        big = int("9" * 4301)
+        body = (
+            '{"left":[{"time":%d,"text":"a"},{"time":%d,"text":"b"}],'
+            '"right":[{"time":%d,"text":"a"},{"time":%d,"text":"b"}],'
+            '"anchors":[{"left":1,"right":1}]}'
+            % (big, big + 5000, big + 120, big + 4800)
+        ).encode()
+        resp = self.raw_post(body)
+        assert resp.status_code == 200
+        assert resp.text != "Internal Server Error"
+        data = resp.json()
+        pinned = data["steps"][1]
+        assert pinned["anchor"] is True
+        assert pinned["cost"] == 200  # |(big+5000) − (big+4800)|
+        assert str(pinned["left"]["time"]) == str(big + 5000)
+        assert str(pinned["right"]["time"]) == str(big + 4800)
+        assert data["total_cost"] == sum(s["cost"] for s in data["steps"])
+
+    def test_duplicate_huge_timestamps_fail_once_not_500(self):
+        # _describe() formats the offending huge int into the message.
+        digits = "9" * 4301
+        body = (
+            '{"left":[{"time":' + digits + ',"text":"a"},'
+            '{"time":' + digits + ',"text":"b"}],"right":[]}'
+        ).encode()
+        resp = self.raw_post(body)
+        assert resp.status_code == 422
+        assert resp.text != "Internal Server Error"
+        data = resp.json()
+        assert set(data.keys()) == {"error", "path"}
+        assert data["path"] == "left[1].time"
+        assert digits in data["error"]
+
+    def test_huge_anchor_index_fails_once_not_500(self):
+        # validate_anchors() formats the offending huge index into the message.
+        digits = "9" * 4301
+        body = (
+            '{"left":[{"time":1,"text":"a"}],"right":[{"time":2,"text":"b"}],'
+            '"anchors":[{"left":' + digits + ',"right":0}]}'
+        ).encode()
+        resp = self.raw_post(body)
+        assert resp.status_code == 422
+        assert resp.text != "Internal Server Error"
+        data = resp.json()
+        assert set(data.keys()) == {"error", "path"}
+        assert data["path"] == "anchors[0].left"
+        assert digits in data["error"]

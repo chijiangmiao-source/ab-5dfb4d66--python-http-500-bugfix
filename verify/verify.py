@@ -10,7 +10,11 @@ Runs against the LIVE containers (no mocks):
   * the single-failure contract for duplicates, over-limit and bad shapes;
   * human-confirmed anchors: pinned rows, segment optimality, single-error
     validation (out-of-range / reused / crossing) and legacy compatibility
-    for requests without anchors.
+    for requests without anchors;
+  * arbitrary-precision timestamps: boundary (4300-digit) and over-threshold
+    (4301+ digit) real API requests succeed with digit-for-digit fidelity,
+    the anchor path computes and serializes huge integers exactly, and
+    rejected huge inputs yield ONE structured 4xx — never HTTP 500.
 
 Uses only the Python standard library so it can run in the slim API image.
 Exit code is 0 only when every check passes.
@@ -23,6 +27,14 @@ import os
 import sys
 import urllib.error
 import urllib.request
+
+# The API contract is arbitrary-precision `time` (see README).  This checker
+# runs on stock Python 3.12, whose default int<->str cap of 4300 digits would
+# otherwise make json.loads/json.dumps below blow up on the very responses
+# this script exists to verify.
+_set_int_max_str_digits = getattr(sys, "set_int_max_str_digits", None)
+if _set_int_max_str_digits is not None:
+    _set_int_max_str_digits(0)
 
 API_URL = os.environ.get("API_URL", "http://api:8000")
 WEB_URL = os.environ.get("WEB_URL", "http://web:80")
@@ -53,6 +65,25 @@ def http(method: str, url: str, payload=None):
             return resp.status, json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode())
+
+
+def http_raw(url: str, body: str) -> tuple[int, str]:
+    """POST a raw JSON text and return (status, raw response text).
+
+    Needed for the arbitrary-precision checks: the exact digit sequence must
+    be verified on the wire, not after a round trip through a serializer.
+    """
+    req = urllib.request.Request(
+        url,
+        data=body.encode(),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, resp.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
 
 
 def get(url: str) -> tuple[int, str]:
@@ -441,6 +472,144 @@ def main() -> int:
         "POST", f"{API_URL}/api/align", {"left": left, "right": right}
     )
     check("removing anchors restores the original result", restored == plain)
+
+    # 9. Arbitrary-precision timestamps (README public contract).  Stock
+    # Python 3.12 caps int<->str conversions at 4300 digits; the API disables
+    # that cap, so boundary AND over-threshold values must align with their
+    # decimal digits preserved exactly, while invalid huge values must fail
+    # ONCE with a structured 4xx.  No request in this section may produce
+    # HTTP 500 / "Internal Server Error".
+
+    # 9a. Boundary value: exactly 4300 digits (CPython's default limit).
+    boundary = "8" * 4300
+    st, txt = http_raw(
+        f"{API_URL}/api/align",
+        '{"left":[{"time":' + boundary + ',"text":"x"}],"right":[]}',
+    )
+    body4300 = json.loads(txt) if st == 200 else {}
+    check(
+        "boundary 4300-digit timestamp aligns (200, digits exact)",
+        st == 200
+        and str(body4300["steps"][0]["left"]["time"]) == boundary
+        and boundary in txt,
+        f"status={st} text={txt[:120]}",
+    )
+
+    # 9b. The reported regression: a 4301-digit `time`, one left record,
+    # empty right side — used to crash json.loads into a bare HTTP 500.
+    over = "9" * 4301
+    st, txt = http_raw(
+        f"{API_URL}/api/align",
+        '{"left":[{"time":' + over + ',"text":"x"}],"right":[]}',
+    )
+    body4301 = json.loads(txt) if st == 200 else {}
+    check(
+        "4301-digit regression request returns 200 (not 500)",
+        st == 200 and "Internal Server Error" not in txt,
+        f"status={st} text={txt[:120]}",
+    )
+    check(
+        "4301-digit timestamp preserved digit-for-digit",
+        st == 200
+        and body4301["steps"][0]["action"] == "right_gap"
+        and body4301["steps"][0]["cost"] == body4301["total_cost"] == 2000
+        and str(body4301["steps"][0]["left"]["time"]) == over
+        and over in txt,
+        f"status={st} text={txt[:120]}",
+    )
+
+    # 9c. Arbitrary precision means no hidden ceiling just past the default.
+    huge = "7" * 10_000
+    st, txt = http_raw(
+        f"{API_URL}/api/align",
+        '{"left":[{"time":' + huge + ',"text":"x"}],"right":[]}',
+    )
+    check(
+        "10000-digit timestamp also aligns (no hidden ceiling)",
+        st == 200
+        and str(json.loads(txt)["steps"][0]["left"]["time"]) == huge,
+        f"status={st} text={txt[:120]}",
+    )
+
+    # 9d. Anchor path with over-threshold timestamps: the pinned row's cost
+    # (|Δt| on huge ints) and the JSON serialization of every huge value
+    # must stay exact.
+    big = int(over)
+    st, txt = http_raw(
+        f"{API_URL}/api/align",
+        '{"left":[{"time":%d,"text":"a"},{"time":%d,"text":"b"}],'
+        '"right":[{"time":%d,"text":"a"},{"time":%d,"text":"b"}],'
+        '"anchors":[{"left":1,"right":1}]}'
+        % (big, big + 5000, big + 120, big + 4800),
+    )
+    anchored_big = json.loads(txt) if st == 200 else {}
+    pinned = anchored_big.get("steps", [{}, {}])[1]
+    check(
+        "anchored alignment with 4301-digit timestamps stays exact",
+        st == 200
+        and pinned.get("anchor") is True
+        and pinned.get("cost") == 200
+        and str(pinned.get("left", {}).get("time")) == str(big + 5000)
+        and str(pinned.get("right", {}).get("time")) == str(big + 4800)
+        and anchored_big.get("total_cost")
+        == sum(s["cost"] for s in anchored_big["steps"]),
+        f"status={st} text={txt[:120]}",
+    )
+
+    # 9e. Invalid huge input: duplicate 4301-digit timestamps must fail ONCE
+    # with a structured 4xx locating left[0].time's successor — the error
+    # message itself embeds the huge value, exercising the formatting path.
+    st, txt = http_raw(
+        f"{API_URL}/api/align",
+        '{"left":[{"time":' + over + ',"text":"a"},'
+        '{"time":' + over + ',"text":"b"}],"right":[]}',
+    )
+    err = json.loads(txt) if st != 500 else {}
+    check(
+        "duplicate 4301-digit timestamps: single structured 4xx at left[1].time",
+        st == 422
+        and set(err.keys()) == {"error", "path"}
+        and err["path"] == "left[1].time"
+        and over in err["error"],
+        f"status={st} text={txt[:120]}",
+    )
+
+    # 9f. A 4301-digit anchor index is out of range and must fail ONCE with a
+    # structured 4xx before any alignment work happens.
+    st, txt = http_raw(
+        f"{API_URL}/api/align",
+        '{"left":[{"time":1,"text":"a"}],"right":[{"time":2,"text":"b"}],'
+        '"anchors":[{"left":' + over + ',"right":0}]}',
+    )
+    err = json.loads(txt) if st != 500 else {}
+    check(
+        "huge anchor index: single structured 4xx at anchors[0].left",
+        st == 422
+        and set(err.keys()) == {"error", "path"}
+        and err["path"] == "anchors[0].left"
+        and over in err["error"],
+        f"status={st} text={txt[:120]}",
+    )
+
+    # 9g. Neither the success nor the failure path may ever answer with the
+    # unstructured 500 body seen before the fix.
+    st_ok, txt_ok = http_raw(
+        f"{API_URL}/api/align",
+        '{"left":[{"time":' + over + ',"text":"x"}],"right":[]}',
+    )
+    st_bad, txt_bad = http_raw(
+        f"{API_URL}/api/align",
+        '{"left":[{"time":' + over + ',"text":"a"},'
+        '{"time":' + over + ',"text":"b"}],"right":[]}',
+    )
+    check(
+        "no huge-timestamp response is HTTP 500 'Internal Server Error'",
+        st_ok == 200
+        and st_bad == 422
+        and "Internal Server Error" not in txt_ok
+        and "Internal Server Error" not in txt_bad,
+        f"ok={st_ok} bad={st_bad}",
+    )
 
     print(f"\n{checks - len(failures)}/{checks} checks passed.")
     if failures:
