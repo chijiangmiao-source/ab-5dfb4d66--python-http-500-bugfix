@@ -26,10 +26,30 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from starlette.responses import Response
 
 from .alignment import align, align_with_anchors
+from .intlimit import (
+    json_dumps_arbitrary_ints,
+    json_loads_arbitrary_ints,
+    unlimited_int_strings,
+)
 from .validation import MAX_ITEMS, validate_anchors, validate_sequence
+
+
+class JSONResponse(Response):
+    """JSON response that preserves arbitrary-precision integer digits.
+
+    Starlette's stock ``JSONResponse`` calls ``json.dumps`` under Python's
+    default 4300-digit cap, which would raise while encoding a huge timestamp;
+    encoding through :func:`json_dumps_arbitrary_ints` keeps every integer's
+    decimal value exactly, never routing it through a float.
+    """
+
+    media_type = "application/json"
+
+    def render(self, content: Any) -> bytes:
+        return json_dumps_arbitrary_ints(content).encode("utf-8")
 
 app = FastAPI(title="Interpreter Handoff Aligner", version="1.0.0")
 
@@ -59,7 +79,7 @@ def health() -> dict[str, str]:
 async def align_notes(request: Request) -> JSONResponse:
     raw = await request.body()
     try:
-        payload: Any = json.loads(raw)
+        payload: Any = json_loads_arbitrary_ints(raw)
     except (json.JSONDecodeError, UnicodeDecodeError):
         return _failure(400, "请求体不是合法的 JSON。")
 
@@ -75,15 +95,20 @@ async def align_notes(request: Request) -> JSONResponse:
     for side in ("left", "right"):
         bad_path = validate_sequence(payload[side], side)
         if bad_path is not None:
-            return _failure(422, _describe(payload[side], bad_path, side), bad_path)
+            # The message may embed the offending timestamp's decimal digits.
+            with unlimited_int_strings():
+                message = _describe(payload[side], bad_path, side)
+            return _failure(422, message, bad_path)
 
     # Optional human-confirmed anchors.  Absent (or an empty array) keeps the
     # legacy code path — and the legacy response — byte-for-byte identical.
     anchors = payload.get("anchors")
     if anchors is not None:
-        anchor_error = validate_anchors(
-            anchors, len(payload["left"]), len(payload["right"])
-        )
+        # Error messages embed the offending (arbitrarily large) indices.
+        with unlimited_int_strings():
+            anchor_error = validate_anchors(
+                anchors, len(payload["left"]), len(payload["right"])
+            )
         if anchor_error is not None:
             path, message = anchor_error
             return _failure(422, message, path)

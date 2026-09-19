@@ -21,12 +21,14 @@ services:
       - "${WEB_PORT:-8080}:80"
 
   # One-off acceptance service: real cross-container integration check
-  # (health, a golden alignment, cost rules, single-error contract).
+  # (health, a golden alignment, cost rules, single-error contract, anchor
+  # paths, arbitrary-precision 4300/4301/10000-digit timestamps over real
+  # HTTP, and a real-Chromium BigInt input/submit/result round trip).
   # Run with:  docker compose run --rm verify
   verify:
     build:
-      context: ./backend
-    image: handoff-aligner-api
+      context: ./verify
+    image: handoff-aligner-verify
     depends_on:
       api:
         condition: service_healthy
@@ -37,4 +39,4 @@ services:
     environment:
       API_URL: http://api:8000
       WEB_URL: http://web:80
-    entrypoint: ["python", "/verify/verify.py"]
+    entrypoint: ["python3", "/verify/verify.py"]

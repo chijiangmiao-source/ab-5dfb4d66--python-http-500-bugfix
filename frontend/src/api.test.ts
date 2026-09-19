@@ -121,6 +121,31 @@ describe("alignNotes", () => {
     ).rejects.toBeInstanceOf(AlignRequestError);
   });
 
+  it("parses a 4301-digit response integer as an exact bigint (no Number)", async () => {
+    const digits = "9".repeat(4301);
+    const raw =
+      `{"steps":[{"action":"right_gap","left":{"time":${digits},"text":"x"},` +
+      `"right":null,"cost":2000,"cumulative_cost":2000}],"total_cost":2000,` +
+      `"counts":{"match":0,"left_gap":0,"right_gap":1},` +
+      `"costs":{"gap":2000,"mismatch_penalty":3000}}`;
+    const fetchMock = vi.fn(
+      async (_url: string, _init?: RequestInit) =>
+        new Response(raw, { headers: { "Content-Type": "application/json" } }),
+    );
+    const result = await alignNotes(
+      `[{"time":${digits},"text":"x"}]`,
+      "[]",
+      [],
+      fetchMock as unknown as typeof fetch,
+    );
+    const time = result.steps[0].left!.time;
+    expect(typeof time).toBe("bigint");
+    expect(time.toString()).toBe(digits);
+    // The request body kept the raw digits too.
+    const [, sentInit] = fetchMock.mock.calls[0];
+    expect(sentInit!.body as string).toContain(digits);
+  });
+
   it("appends anchors to the request body only when non-empty", async () => {
     const bodies: string[] = [];
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {

@@ -69,6 +69,12 @@ describe("validateSequence", () => {
     expect(validateSequence([n(t), n(t)])?.path).toBe("[1].time");
   });
 
+  it("accepts a 4301-digit integer and rejects its duplicate (no JS digit cap)", () => {
+    const t = BigInt("9".repeat(4301));
+    expect(validateSequence([n(t)])).toBeNull();
+    expect(validateSequence([n(t), n(t)])?.path).toBe("[1].time");
+  });
+
   it("rejects float times even though they are numbers", () => {
     expect(validateSequence([n(1.0), n(2.5)])?.path).toBe("[1].time");
   });

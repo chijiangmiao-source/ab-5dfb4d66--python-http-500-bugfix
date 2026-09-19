@@ -24,6 +24,14 @@ import sys
 import urllib.error
 import urllib.request
 
+# This acceptance harness legitimately builds and parses responses carrying
+# arbitrary-precision integer timestamps (the product contract), so the PEP
+682
+# digit cap is lifted for the harness itself.  The API process keeps its
+# default 4300-digit safety threshold and lifts it only around JSON
+# parse/serialize; these checks prove that contract end to end.
+sys.set_int_max_str_digits(0)
+
 API_URL = os.environ.get("API_URL", "http://api:8000")
 WEB_URL = os.environ.get("WEB_URL", "http://web:80")
 
@@ -42,6 +50,11 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 def http(method: str, url: str, payload=None):
     data = json.dumps(payload).encode() if payload is not None else None
+    return http_raw(method, url, data)
+
+
+def http_raw(method: str, url: str, data: bytes | None):
+    """Send a pre-encoded body so huge integer digits stay byte-for-byte."""
     req = urllib.request.Request(
         url,
         data=data,
@@ -52,12 +65,154 @@ def http(method: str, url: str, payload=None):
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status, json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read().decode())
+        raw = e.read().decode()
+        try:
+            return e.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return e.code, {"__unparseable__": raw}
 
 
 def get(url: str) -> tuple[int, str]:
     with urllib.request.urlopen(url, timeout=10) as resp:
         return resp.status, resp.read().decode()
+
+
+def browser_roundtrip_checks() -> None:
+    """Drive a real Chromium through the built SPA for the BigInt contract."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:  # pragma: no cover - image should provide it
+        check("browser BigInt round trip (playwright import)", False, str(exc))
+        return
+
+    huge = "9" * 4301
+    left_one = f'[{{"time":{huge},"text":"超长时间戳"}}]'
+    captured: dict[str, object] = {}
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
+            page = browser.new_page()
+
+            page.on(
+                "request",
+                lambda req: captured.update(req_body=req.post_data)
+                if "/api/align" in req.url and req.method == "POST"
+                else None,
+            )
+            page.on(
+                "response",
+                lambda resp: captured.update(
+                    resp_status=resp.status, resp_url=resp.url
+                )
+                if "/api/align" in resp.url and resp.request.method == "POST"
+                else None,
+            )
+
+            page.goto(WEB_URL, wait_until="networkidle")
+            page.get_by_test_id("input-left").fill(left_one)
+            page.get_by_test_id("input-right").fill("[]")
+            page.get_by_test_id("submit").click()
+
+            # Success path: the timeline (not the error banner) appears.
+            try:
+                page.get_by_test_id("result-panel").wait_for(timeout=15000)
+                panel_ok = True
+            except Exception:
+                panel_ok = False
+            check("browser: 4301-digit submit shows a result (no error banner)", panel_ok)
+            check(
+                "browser: no error banner for the 4301-digit input",
+                page.get_by_test_id("error-banner").count() == 0,
+            )
+            check(
+                "browser: API call answered 200",
+                captured.get("resp_status") == 200,
+                f"status={captured.get('resp_status')}",
+            )
+            # The wire request body carried the exact digits (raw text, never
+            # a re-serialized Number).
+            req_body = captured.get("req_body") or ""
+            check(
+                "browser: request body carried all 4301 digits verbatim",
+                huge in req_body,
+                f"len={len(req_body)}",
+            )
+
+            # Rendered result read back INSIDE the JS engine: BigInt equality
+            # and an exact string prove no Number truncation on result read.
+            result = page.evaluate(
+                """(digits) => {
+                    const el = document.querySelector(
+                        '[data-testid="timeline-row"] .time');
+                    if (!el) return {found: false};
+                    const text = el.textContent.replace(/\\s*ms$/, '').trim();
+                    let bigOk = false;
+                    try { bigOk = BigInt(text) === BigInt(digits); }
+                    catch (e) { bigOk = false; }
+                    // Demonstrate the Number hazard this path must avoid:
+                    // Number rewrites these digits, BigInt does not.
+                    const numberRewrites = String(Number(digits)) !== digits;
+                    return {
+                        found: true,
+                        exact: text === digits,
+                        lenOk: text.length === digits.length,
+                        bigOk,
+                        numberRewrites,
+                    };
+                }""",
+                huge,
+            )
+            check(
+                "browser: rendered timestamp matches input digit-for-digit",
+                result.get("found") and result.get("exact") and result.get("lenOk"),
+                str(result),
+            )
+            check(
+                "browser: BigInt survives while Number would rewrite it",
+                result.get("bigOk") and result.get("numberRewrites"),
+                str(result),
+            )
+            check(
+                "browser: one right_gap row (single left note, empty right)",
+                page.get_by_test_id("timeline-row").count() == 1
+                and page.get_by_test_id("timeline-row")
+                .first.get_attribute("data-action") == "right_gap",
+            )
+
+            # Rejected-input UX: a duplicate over-threshold timestamp must
+            # surface the SAME single located field error in the page (the UI
+            # mirrors the server validation and may short-circuit before the
+            # request) — never a generic service exception / 500.
+            page.get_by_test_id("input-left").fill(
+                f'[{{"time":{huge},"text":"a"}},{{"time":{huge},"text":"b"}}]'
+            )
+            page.get_by_test_id("submit").click()
+            try:
+                page.get_by_test_id("error-banner").wait_for(timeout=15000)
+                banner = page.get_by_test_id("error-banner")
+                banner_text = banner.text_content() or ""
+                path_text = page.get_by_test_id("error-path").text_content() or ""
+                rejected_ok = True
+            except Exception:
+                banner_text, path_text, rejected_ok = "", "", False
+            check(
+                "browser: rejected huge input shows located field error left[1].time",
+                rejected_ok and "left[1].time" in path_text,
+                f"path={path_text!r}",
+            )
+            check(
+                "browser: rejection shows no timeline and no generic server error",
+                rejected_ok
+                and page.get_by_test_id("result-panel").count() == 0
+                and "Internal Server Error" not in banner_text,
+            )
+
+            browser.close()
+    except Exception as exc:
+        check("browser BigInt round trip ran against the SPA", False, repr(exc))
 
 
 def main() -> int:
@@ -218,6 +373,155 @@ def main() -> int:
     check(
         "genuine duplicate huge integer still fails once at left[1].time",
         status == 422 and body.get("path") == "left[1].time",
+        f"status={status} body={body}",
+    )
+
+    # 5c-quater. Python 3.12's PEP 682 integer digit cap (4300 decimal
+    # digits by default) used to make json.loads raise a plain ValueError on
+    # a 4301-digit timestamp, which escaped the JSONDecodeError-only handler
+    # and surfaced as an unstructured HTTP 500.  The public contract is
+    # arbitrary precision, so boundary AND over-threshold values must both
+    # align over real HTTP with the digits unchanged.
+    def post_bytes(body: bytes):
+        """POST raw bytes, returning (status, parsed_json, raw_text)."""
+        req = urllib.request.Request(
+            f"{API_URL}/api/align",
+            data=body,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                text = resp.read().decode("utf-8", "replace")
+                return resp.status, json.loads(text), text
+        except urllib.error.HTTPError as e:
+            text = e.read().decode("utf-8", "replace")
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = None
+            return e.code, parsed, text
+
+    def single_side(digits: str) -> bytes:
+        return (
+            b'{"left":[{"time":' + digits.encode() + b',"text":"x"}],"right":[]}'
+        )
+
+    # Exactly at the boundary (4300 digits): must be 200, not 500.
+    boundary_digits = "7" * 4300
+    status, body, text = post_bytes(single_side(boundary_digits))
+    check(
+        "4300-digit boundary timestamp aligns (200, exact digits)",
+        status == 200
+        and body is not None
+        and body["steps"][0]["left"]["time"] == int(boundary_digits)
+        and boundary_digits in text
+        and "Internal Server Error" not in text,
+        f"status={status} text={text[:120]}",
+    )
+
+    # One digit over the threshold (the reported 4301-digit regression):
+    # single left record, empty right -> one right_gap row, total 2000, and
+    # the returned timestamp decimal string matches the input digit-for-digit.
+    report_digits = "9" * 4301
+    status, body, text = post_bytes(single_side(report_digits))
+    check(
+        "4301-digit reported timestamp returns 200 (regression), not 500",
+        status == 200 and "Internal Server Error" not in text,
+        f"status={status} text={text[:120]}",
+    )
+    check(
+        "4301-digit response keeps exact value, shape, action and cost",
+        body is not None
+        and len(body["steps"]) == 1
+        and body["steps"][0]["action"] == "right_gap"
+        and body["steps"][0]["right"] is None
+        and body["steps"][0]["left"]["time"] == int(report_digits)
+        and isinstance(body["steps"][0]["left"]["time"], int)
+        and body["total_cost"] == 2000
+        and report_digits in text,
+        f"body={str(body)[:160]}",
+    )
+
+    # Far over the threshold (10000 digits): still exact arbitrary precision.
+    far_digits = "1" + "234567890" * 1111
+    assert len(far_digits) == 10000
+    status, body, text = post_bytes(single_side(far_digits))
+    check(
+        "10000-digit timestamp aligns and round-trips exactly",
+        status == 200
+        and body is not None
+        and body["steps"][0]["left"]["time"] == int(far_digits)
+        and far_digits in text
+        and "Internal Server Error" not in text,
+        f"status={status}",
+    )
+
+    # An over-threshold timestamp must actually traverse the anchor cost
+    # computation AND JSON response serialization: force one anchor between
+    # two huge records differing by exactly 3; texts differ, so the pinned
+    # match row costs |3| + 3000 = 3003 and both timestamps stay exact.
+    left_big = "9" * 4301
+    right_big = "9" * 4300 + "6"  # ...9996 vs ...9999 -> |diff| = 3
+    assert int(left_big) - int(right_big) == 3
+    anchor_body = (
+        b'{"left":[{"time":' + left_big.encode() + b',"text":"x"}],'
+        b'"right":[{"time":' + right_big.encode() + b',"text":"y"}],'
+        b'"anchors":[{"left":0,"right":0}]}'
+    )
+    status, body, text = post_bytes(anchor_body)
+    check(
+        "huge timestamp through anchor cost + serialization returns 200",
+        status == 200 and "Internal Server Error" not in text,
+        f"status={status} text={text[:120]}",
+    )
+    check(
+        "anchored huge row is a flagged exact match costing 3003",
+        body is not None
+        and len(body["steps"]) == 1
+        and body["steps"][0]["anchor"] is True
+        and body["steps"][0]["action"] == "match"
+        and body["steps"][0]["cost"] == 3003
+        and body["total_cost"] == 3003
+        and body["steps"][0]["left"]["time"] == int(left_big)
+        and body["steps"][0]["right"]["time"] == int(right_big)
+        and left_big in text
+        and right_big in text,
+        f"body={str(body)[:200]}",
+    )
+
+    # A huge integer that violates a rule must still be a single structured
+    # 4xx located at the offending field — never a 500.
+    dup_digits = "5" * 5000
+    dup_body = (
+        b'{"left":[{"time":' + dup_digits.encode() + b',"text":"a"},'
+        b'{"time":' + dup_digits.encode() + b',"text":"b"}],"right":[]}'
+    )
+    status, body, text = post_bytes(dup_body)
+    check(
+        "duplicate over-threshold time -> single structured 422 at left[1].time",
+        status == 422
+        and isinstance(body, dict)
+        and set(body.keys()) == {"error", "path"}
+        and body["path"] == "left[1].time"
+        and "Internal Server Error" not in text,
+        f"status={status} body={body}",
+    )
+
+    # A 4301-digit anchor index is a syntactically valid integer but can never
+    # be an in-range index: same one-error, located 4xx contract.
+    huge_index_body = (
+        b'{"left":[{"time":1,"text":"x"}],"right":[{"time":2,"text":"y"}],'
+        b'"anchors":[{"left":' + b"9" * 4301 + b',"right":0}]}'
+    )
+    status, body, text = post_bytes(huge_index_body)
+    check(
+        "over-threshold anchor index -> single structured 422 at anchors[0].left",
+        status == 422
+        and isinstance(body, dict)
+        and set(body.keys()) == {"error", "path"}
+        and body["path"] == "anchors[0].left"
+        and "Internal Server Error" not in text,
         f"status={status} body={body}",
     )
 
@@ -441,6 +745,9 @@ def main() -> int:
         "POST", f"{API_URL}/api/align", {"left": left, "right": right}
     )
     check("removing anchors restores the original result", restored == plain)
+
+    # 9. Real-browser BigInt round trip for the reported 4301-digit value.
+    browser_roundtrip_checks()
 
     print(f"\n{checks - len(failures)}/{checks} checks passed.")
     if failures:

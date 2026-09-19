@@ -1,5 +1,7 @@
 import { expect, test } from "@playwright/test";
 
+import { parseLocated } from "../jsonLocations";
+
 /**
  * Real full-stack integration: these tests drive a browser against the built
  * frontend talking to the live FastAPI process (same-origin via the preview
@@ -171,4 +173,66 @@ test("only-left notes label the right side as blank and carry content on the lef
   await expect(cells.nth(1)).toContainText("仅左侧记录");
   await expect(cells.nth(3)).toContainText("∅");
   await expect(page.getByTestId("step-cost")).toHaveText("2000");
+});
+
+test("a 4301-digit timestamp (past Python's int digit cap) round-trips exactly", async ({
+  page,
+  request,
+}) => {
+  // The reported HTTP 500 input: one left record whose time has 4301 decimal
+  // digits, empty right. It must align (200) and come back digit-for-digit.
+  const digits = "9".repeat(4301);
+
+  // --- Real HTTP contract through the same-origin proxy ---
+  // Send the raw digits as the request body: Playwright's object-form `data`
+  // would re-serialize through JS Number and lose the precision.
+  const rawResp = await request.post("/api/align", {
+    headers: { "Content-Type": "application/json" },
+    data: `{"left":[{"time":${digits},"text":"x"}],"right":[]}`,
+  });
+  expect(rawResp.status()).toBe(200);
+  const rawText = await rawResp.text();
+  expect(rawText).not.toContain("Internal Server Error");
+  expect(rawText).toContain(digits);
+  // Parsed with the BigInt-aware parser, the value is exactly unchanged.
+  const parsed = parseLocated(rawText).value as {
+    steps: Array<{ left: { time: bigint } }>;
+    total_cost: bigint;
+  };
+  expect(parsed.steps[0].left.time.toString()).toBe(digits);
+  expect(parsed.total_cost).toBe(2000n);
+
+  // --- Browser input -> submit -> result read round trip ---
+  await page.getByTestId("input-left").fill(`[{"time":${digits},"text":"x"}]`);
+  await page.getByTestId("input-right").fill("[]");
+  await page.getByTestId("submit").click();
+
+  await expect(page.getByTestId("result-panel")).toBeVisible();
+  await expect(page.getByTestId("error-banner")).toHaveCount(0);
+  const row = page.getByTestId("timeline-row");
+  await expect(row).toHaveCount(1);
+  await expect(row).toHaveAttribute("data-action", "right_gap");
+  // All 4301 digits rendered, not a Number-rounded/rewritten value.
+  await expect(row.locator(".time")).toContainText(digits);
+  const rendered = await row.locator(".time").innerText();
+  expect(rendered.replace(/\s*ms$/, "").trim()).toBe(digits);
+  // Number would rewrite these digits — the app must not have.
+  expect(String(Number(digits))).not.toBe(digits);
+});
+
+test("a rejected 4301-digit duplicate shows the located field error, not a 500", async ({
+  page,
+}) => {
+  const digits = "5".repeat(5000);
+  await page
+    .getByTestId("input-left")
+    .fill(`[{"time":${digits},"text":"a"},{"time":${digits},"text":"b"}]`);
+  await page.getByTestId("input-right").fill("[]");
+  await page.getByTestId("submit").click();
+
+  const banner = page.getByTestId("error-banner");
+  await expect(banner).toBeVisible();
+  await expect(page.getByTestId("error-path")).toHaveText("left[1].time ");
+  await expect(banner).not.toContainText("Internal Server Error");
+  await expect(page.getByTestId("result-panel")).toHaveCount(0);
 });

@@ -33,6 +33,20 @@ describe("parseLocated", () => {
     expect(JSON.parse(`9007199254740993`)).toBe(9007199254740992);
   });
 
+  it("keeps a 4301-digit integer exact (past Python's PEP 682 digit cap)", () => {
+    // The reported HTTP 500 timestamp: 4301 decimal digits. JavaScript
+    // BigInt has no digit cap, so the value must survive parse and
+    // re-stringify with every digit intact, never going through Number.
+    const digits = "9".repeat(4301);
+    const { value } = parseLocated(`[{"time": ${digits}, "text": "x"}]`);
+    const time = (value as Array<{ time: bigint }>)[0].time;
+    expect(typeof time).toBe("bigint");
+    expect(time.toString()).toBe(digits);
+    expect(BigInt(digits) === time).toBe(true);
+    // Number would rewrite the value; BigInt must not.
+    expect(String(Number(digits))).not.toBe(digits);
+  });
+
   it("parses nested structures like JSON.parse (modulo integer bigints)", () => {
     const { value } = parseLocated(`{"a": {"b": [10, {"c": 20}]}}`);
     expect(value).toEqual({ a: { b: [10n, { c: 20n }] } });
